@@ -37,6 +37,7 @@ import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
 import { rememberTabAfterLogin } from './lib/tabAfterLogin';
 import { JobPollError, pollFailureAction } from './lib/jobPoll';
 import { uploadInChunks, slotAfterSubmit, keptSlotToDrop } from './lib/chunkedUpload';
+import { sentAdvancedParams } from './lib/advancedParams';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -1298,23 +1299,7 @@ function App() {
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
-      const advanced = {
-        target_clips: data.targetClips || null,
-        clip_min_seconds: data.clipMinSeconds || null,
-        clip_max_seconds: data.clipMaxSeconds || null,
-        // Sent explicitly both ways: absent means off for raw API callers,
-        // but the dashboard always states the user's choice.
-        auto_hook: data.autoHook ? '1' : '0',
-        auto_hook_style: data.autoHook ? (data.autoHookStyle || 'pill') : null,
-        // 'auto' is the server default, so only a deliberate choice travels.
-        layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
-        // Set when the user took the quota wall's "clip the first N minutes"
-        // offer: the server reserves N minutes and cuts the source to them.
-        max_minutes: data.maxMinutes || null,
-        // The stretch picked under the cost line (seconds); absent = whole video.
-        source_start: data.sourceStart ?? null,
-        source_end: data.sourceEnd ?? null,
-      };
+      const advanced = sentAdvancedParams(data);
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
@@ -1323,7 +1308,7 @@ function App() {
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
           force_low_quality: forceLowQuality,
-          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+          ...advanced,
         });
       } else if (data.type === 'thumbnail_session') {
         // Handover from Thumbnail Studio (issue #68): the video and transcript
@@ -1333,7 +1318,7 @@ function App() {
           thumbnail_session_id: data.payload,
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
-          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+          ...advanced,
         });
       } else {
         // Files go up first in 50 MB chunks (Cloudflare refuses request bodies
@@ -1353,7 +1338,7 @@ function App() {
           upload_id: uploadId,
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
-          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+          ...advanced,
         });
       }
 

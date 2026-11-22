@@ -5,6 +5,7 @@ import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
 import { useAuth } from '../contexts/AuthContext';
 import { FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VIDEO } from '../lib/clipProgress';
+import { clampPartSeconds, PART_SECONDS_MIN, PART_SECONDS_MAX, PART_SECONDS_DEFAULT } from '../lib/advancedParams';
 
 const SUPPORTED_PLATFORMS = [
     'YouTube', 'Vimeo', 'TikTok', 'X / Twitter', 'Twitch', 'Kick',
@@ -67,6 +68,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
+    // Parts mode: the whole video cut in order into equal parts (1. Part,
+    // 2. Part…) instead of AI-picked clips. A per-video choice, so it is not
+    // remembered. The hook is always on in parts mode; `autoHook` keeps the
+    // user's own choice untouched, so turning parts mode off restores it.
+    const [partsMode, setPartsMode] = useState(false);
+    const [partSeconds, setPartSeconds] = useState(String(PART_SECONDS_DEFAULT));
+    const hookOn = autoHook || partsMode;
     const infoRef = useRef(null);
 
     // Close the compatibility popover on any outside click.
@@ -132,6 +140,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
+            partsMode,
+            partSeconds: partsMode ? clampPartSeconds(partSeconds) : null,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
@@ -315,7 +325,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
+                        {(partsMode || targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
@@ -323,6 +333,34 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         /* Stacked on a phone: three number fields side by side leaves
                            ~100px each, which crushes both label and value. */
                         <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-2 animate-fade">
+                            <div className={`col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 ${partsMode ? '' : 'pb-3 sm:pb-1 border-b border-rule'}`}>
+                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={partsMode}
+                                        onChange={(e) => setPartsMode(e.target.checked)}
+                                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                                    />
+                                    Part part böl
+                                </label>
+                                {partsMode && (
+                                    <label className="flex items-center gap-2 text-xs text-ink2">
+                                        Parça süresi (sn)
+                                        <input
+                                            type="number" min={PART_SECONDS_MIN} max={PART_SECONDS_MAX} step="1"
+                                            value={partSeconds}
+                                            onChange={(e) => setPartSeconds(e.target.value)}
+                                            onBlur={() => setPartSeconds(String(clampPartSeconds(partSeconds)))}
+                                            placeholder={String(PART_SECONDS_DEFAULT)}
+                                            className="input-field !w-20 text-xs py-1.5"
+                                        />
+                                    </label>
+                                )}
+                                <p className="w-full text-[11px] leading-relaxed text-muted">
+                                    Videonun tamamı sırayla parçalara bölünür (1. Part, 2. Part…)
+                                </p>
+                            </div>
+                            {!partsMode && (<>
                             <div>
                                 <p className="eyebrow mb-1.5">clips to aim for</p>
                                 <input
@@ -372,17 +410,19 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     <option value="none">Single crop only</option>
                                 </select>
                             </div>
+                            </>)}
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
-                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                <label className={`flex items-center gap-2 text-xs text-ink2 select-none ${partsMode ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
                                     <input
                                         type="checkbox"
-                                        checked={autoHook}
+                                        checked={hookOn}
+                                        disabled={partsMode}
                                         onChange={(e) => setAutoHook(e.target.checked)}
-                                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                                        className={`w-4 h-4 shrink-0 accent-[var(--color-accent)] ${partsMode ? 'cursor-not-allowed' : 'cursor-pointer'}`}
                                     />
                                     auto hook titles on clips
                                 </label>
-                                {autoHook && (
+                                {hookOn && (
                                     <select
                                         value={autoHookStyle}
                                         onChange={(e) => setAutoHookStyle(e.target.value)}
@@ -397,7 +437,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                         <option value="outline_yellow">Outline+</option>
                                     </select>
                                 )}
-                                {autoHook && (
+                                {partsMode && (
+                                    <p className="w-full text-[11px] leading-relaxed text-muted">
+                                        Part modunda hook her zaman açık
+                                    </p>
+                                )}
+                                {hookOn && (
                                     <p className="w-full text-[11px] leading-relaxed text-muted">
                                         You can change each clip&apos;s hook text, style, position and size
                                         afterwards with its hook button.
