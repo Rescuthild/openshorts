@@ -83,23 +83,26 @@ def _choose_cut(t, prev, duration, words, pauses, sentence_ends, scene_cuts):
     """The cut for target ``t`` (spec §3.2, rules 1-5)."""
     hard_hi = min(prev + MAX_PART, duration)
 
+    # Words that can matter anywhere in the widest window.
+    near = [w for w in words if w[0] < t + WIDE_WINDOW and w[1] > t - WIDE_WINDOW]
+
+    def inside_word(x):
+        # Strictly inside: a boundary where two words touch is not inside.
+        return any(s < x - _EPS and x + _EPS < e for s, e, _ in near)
+
     def valid(c):
         return prev < c < duration and c <= prev + MAX_PART + _EPS
 
-    # 1-2. A sentence end within ±5 s, then ±10 s: cut in the pause after it.
+    # 1-2. A sentence end within ±5 s, then ±10 s: cut in the pause after it
+    # (up to the next word's start; zero-width when the words touch).
     for w in (WINDOW, WIDE_WINDOW):
         lo, hi = t - w, min(t + w, hard_hi)
         cands = []
         for se in sentence_ends:
-            if not lo <= se <= hi:
+            if not lo <= se <= hi or inside_word(se):
                 continue
-            pause = next((p for p in pauses if p[0] - _EPS <= se <= p[1] + _EPS), None)
-            if pause is None:       # the sentence end falls inside a word
-                continue
-            a, b = max(se, pause[0]), min(pause[1], hi)
-            if b < a:
-                continue
-            c = _cut_in(a, b, scene_cuts, t)
+            nxt = min((s for s, _, _ in near if s >= se - _EPS), default=float("inf"))
+            c = _cut_in(se, max(se, min(nxt, hi)), scene_cuts, t)
             if valid(c):
                 cands.append(c)
         if cands:
@@ -128,8 +131,9 @@ def _choose_cut(t, prev, duration, words, pauses, sentence_ends, scene_cuts):
         return best[1]
 
     # 5. Continuous speech: the nearest word end.
-    c = _nearest([e for _, e, _ in words
-                  if t - WIDE_WINDOW <= e <= t + WIDE_WINDOW and valid(e)], t)
+    c = _nearest([e for _, e, _ in near
+                  if t - WIDE_WINDOW <= e <= t + WIDE_WINDOW and valid(e)
+                  and not inside_word(e)], t)
     return t if c is None else c
 
 
@@ -139,7 +143,8 @@ def plan_parts(duration: float, part_seconds: int,
                max_parts: int = 60) -> list[tuple[float, float]]:
     """Contiguous ``(start, end)`` ranges from 0 to ``duration``, each about
     ``part_seconds`` long (spec §3). When the ``max_parts`` cap is hit the
-    ranges stop at the last cut and the rest of the video is not produced."""
+    result is exactly ``max_parts`` ranges ending at the last cut; the rest of
+    the video, however short, is not produced (no tail merge then)."""
     if not MIN_PART_SECONDS <= part_seconds <= MAX_PART_SECONDS:
         raise ValueError(f"part_seconds must be {MIN_PART_SECONDS}-{MAX_PART_SECONDS}, "
                          f"got {part_seconds}")
@@ -162,9 +167,12 @@ def plan_parts(duration: float, part_seconds: int,
         prev = _choose_cut(t, prev, duration, words, pauses, sentence_ends, scene_cuts)
         cuts.append(prev)
 
+    if len(cuts) == max_parts:      # cap hit: drop everything after the last cut
+        return list(zip([0.0] + cuts[:-1], cuts))
+
+    # The loop ended because the next target passed the end of the video.
     ranges = list(zip([0.0] + cuts, cuts + [duration]))
     if (len(ranges) >= 2 and ranges[-1][1] - ranges[-1][0] < TAIL_MERGE
             and ranges[-1][1] - ranges[-2][0] <= MAX_PART):
         ranges[-2:] = [(ranges[-2][0], ranges[-1][1])]
-    # Over the cap, the part after the last cut is dropped.
-    return ranges[:max_parts]
+    return ranges

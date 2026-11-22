@@ -3,7 +3,7 @@ snapping each cut to a sentence end, else a pause, else a scene cut — never
 inside a word (spec 2026-11-23-parts-mode-design.md §3)."""
 import pytest
 
-parts = pytest.importorskip("parts")
+import parts
 
 
 def _run(start, n, word=0.75, gap=0.25):
@@ -45,6 +45,13 @@ def test_sentence_end_inside_a_word_is_rejected():
     # 60.5 falls inside the word (60.25, 61.0): not a usable cut; 63.0 is.
     cut = _first_cut(120.0, 60, SPEECH_120, sentence_ends=[60.5, 63.0], scene_cuts=[])
     assert cut == pytest.approx(63.125)
+
+
+def test_sentence_end_at_touching_word_boundary_is_used():
+    # Words touch (no gap, as parakeet / DTW timestamps do): the sentence end
+    # at 57.0 is a zero-width boundary, not inside a word, so it is the cut.
+    words = _run(0.0, 120, word=1.0, gap=0.0)
+    assert _first_cut(120.0, 60, words, sentence_ends=[57.0], scene_cuts=[]) == 57.0
 
 
 def test_window_widens_to_ten_seconds():
@@ -90,6 +97,16 @@ def test_continuous_speech_cuts_on_word_boundary():
     assert cut == pytest.approx(59.95)
 
 
+def test_word_end_inside_overlapping_word_is_rejected():
+    # The word before 60 ends at 59.95, but the next word overlaps it (starts at
+    # 59.9), so 59.95 lies inside a word; the nearest clean word end is 60.95.
+    words = _run(0.05, 120, word=0.9, gap=0.1)
+    words[60] = (59.9, 60.95, "w")
+    cut = _first_cut(120.0, 60, words, [], [])
+    assert not any(s < cut < e for (s, e, _) in words)
+    assert cut == pytest.approx(60.95)
+
+
 def test_tail_under_20s_merges():
     assert parts.plan_parts(139.0, 60, [], [], []) == [(0.0, 60.0), (60.0, 139.0)]
 
@@ -118,6 +135,13 @@ def test_max_parts_cap():
     r = parts.plan_parts(7200.0, 60, [], [], [])
     assert len(r) == 60
     assert r[-1] == (3540.0, 3600.0)   # the remainder past the 60th cut is dropped
+
+
+def test_max_parts_cap_drops_short_remainder_too():
+    # A 10 s remainder past the 60th cut is dropped, not merged into part 60.
+    r = parts.plan_parts(3610.0, 60, [], [], [])
+    assert len(r) == 60
+    assert r[-1] == (3540.0, 3600.0)
 
 
 def test_parts_are_contiguous_and_cover_video():
