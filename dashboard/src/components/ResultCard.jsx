@@ -910,7 +910,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         ordered by score, but this is what the downloaded file
                         is called (clip-N.mp4) and what every api call indexes.
                         A part of a parts-mode run is named by its part number. */}
-                    <span className="bg-black/70 text-ink font-mono text-micro uppercase px-2 py-1 rounded-full">
+                    <span className={`bg-black/70 text-ink font-mono text-micro ${clip.part_number ? 'normal-case' : 'uppercase'} px-2 py-1 rounded-full`}>
                         {clip.part_number ? `${clip.part_number}. Part` : `Clip ${index + 1}`}
                     </span>
                     {/* A bare number on a thumbnail reads as a duration, a
