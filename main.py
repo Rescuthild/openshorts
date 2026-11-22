@@ -2337,9 +2337,45 @@ def transcribe_video(video_path, slot_timeout=None):
 
     return transcript
 
+def _gemini_fallback_models(model_name):
+    """Models to try after ``model_name`` when Gemini keeps answering
+    503/429: ``GEMINI_FALLBACK_MODELS`` (comma-separated), in order, without
+    repeats. Empty by default, which keeps the single-model behaviour."""
+    raw = os.environ.get("GEMINI_FALLBACK_MODELS", "")
+    out = []
+    for name in (n.strip() for n in raw.split(",")):
+        if name and name != model_name and name not in out:
+            out.append(name)
+    return out
+
+
+def _gemini_retry_base_seconds():
+    """First backoff wait (doubles per attempt): ``GEMINI_RETRY_BASE_SECONDS``,
+    default 5 (5 s, then 10 s)."""
+    try:
+        return max(1.0, float(os.environ.get("GEMINI_RETRY_BASE_SECONDS", "5")))
+    except ValueError:
+        return 5.0
+
+
+def gemini_http_options():
+    """``HttpOptions`` with a per-request timeout from ``GEMINI_TIMEOUT_SECONDS``
+    (0/unset = none, the SDK default). Without one, a free-tier key on a busy
+    model sat ~4 min per request before the 503 came back (19-nov-2026)."""
+    try:
+        secs = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "0"))
+    except ValueError:
+        secs = 0.0
+    return genai_types.HttpOptions(timeout=int(secs * 1000)) if secs > 0 else None
+
+
 def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
     Returns (parsed_dict, cost_analysis).
+
+    When every attempt on ``model_name`` fails with a transient error, the
+    models in ``GEMINI_FALLBACK_MODELS`` are tried in turn with the same
+    retry policy; the cost is computed for whichever model answered.
 
     With an OpenAI-compatible server configured (``llm_backend.active()``)
     the call goes there instead of Gemini and ``client`` is unused; the
@@ -2347,11 +2383,38 @@ def _run_gemini_stage(client, model_name, prompt, schema):
     shapes (connection refused while the model loads, a truncated body,
     a 5xx from a busy vLLM)."""
     use_local = llm_backend.active()
+    chain = [model_name] if use_local else [model_name] + _gemini_fallback_models(model_name)
+    for i, current in enumerate(chain):
+        try:
+            return _run_gemini_stage_one(client, current, prompt, schema, use_local)
+        except gemini_worker.GeminiBlockedError:
+            raise
+        except Exception as e:
+            if i + 1 >= len(chain) or not _is_transient_llm_error(str(e)):
+                raise
+            print(f"↪️ Gemini fallback: {current} kept failing ({str(e)[:80]}); trying {chain[i + 1]}")
+
+
+def _is_transient_llm_error(msg):
+    return any(tok in msg for tok in (
+        '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
+        '500', 'INTERNAL', 'overloaded', 'Deadline',
+        'empty response body', 'did not contain a JSON object',
+        'Failed to parse Gemini JSON response',
+        # OpenAI-compatible servers: model still loading, busy, or a
+        # small model that skipped a required field this time.
+        'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
+        'validation error', 'timed out', 'Timeout'))
+
+
+def _run_gemini_stage_one(client, model_name, prompt, schema, use_local):
+    """``_run_gemini_stage`` for a single model: up to 3 attempts."""
     config = None if use_local else genai_types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
     )
     max_attempts = 3
+    base = _gemini_retry_base_seconds()
     for attempt in range(1, max_attempts + 1):
         try:
             if use_local:
@@ -2376,20 +2439,11 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
-            transient = any(tok in msg for tok in (
-                '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-                '500', 'INTERNAL', 'overloaded', 'Deadline',
-                'empty response body', 'did not contain a JSON object',
-                'Failed to parse Gemini JSON response',
-                # OpenAI-compatible servers: model still loading, busy, or a
-                # small model that skipped a required field this time.
-                'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error'))
-            if attempt == max_attempts or not transient:
+            if attempt == max_attempts or not _is_transient_llm_error(msg):
                 raise
-            wait = 5 * (2 ** (attempt - 1))
-            who = "LLM server" if use_local else "Gemini"
-            print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
+            wait = base * (2 ** (attempt - 1))
+            who = "LLM server" if use_local else f"Gemini {model_name}"
+            print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait:.0f}s: {msg[:150]}")
             time.sleep(wait)
 
 
@@ -2458,9 +2512,11 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             print("❌ Error: GEMINI_API_KEY not found in environment variables "
                   "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
             return None
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options=gemini_http_options())
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
-    print(f"\U0001f916  Model: {model_name} | language: {language}")
+    fallbacks = [] if llm_backend.active() else _gemini_fallback_models(model_name)
+    print(f"\U0001f916  Model: {model_name} | language: {language}"
+          + (f" | fallback: {', '.join(fallbacks)}" if fallbacks else ""))
 
     # Full word list — ground truth for snapping cut points.
     words = []
