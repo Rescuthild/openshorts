@@ -9,6 +9,23 @@
 
 const DEFAULT_CHUNK_SIZE = 50 * 1024 * 1024;
 
+// A finished upload's slot after POST /api/process. An unused slot holds the
+// file (up to 2 GB) until it expires and counts against the per-user slot cap,
+// so the submitter deletes it unless a 402 handed it back for the quota wall's
+// resend ('keep'). null: no upload, or the started job took the file.
+export function slotAfterSubmit({ uploadId, failed, quota }) {
+  if (!uploadId || !failed) return null;
+  return quota ? 'keep' : 'delete';
+}
+
+// The slot kept after a 402, when this submit will not reuse it (another file,
+// or no file at all): its upload_id, to delete. null when there is none or the
+// same file is being sent again.
+export function keptSlotToDrop(kept, file) {
+  if (!kept || (file && kept.file === file)) return null;
+  return kept.uploadId;
+}
+
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const uploadError = (detail) => new Error(`Yükleme başarısız: ${detail}`);

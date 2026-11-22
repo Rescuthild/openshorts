@@ -1,7 +1,7 @@
 // Run: node --test src/lib/chunkedUpload.test.mjs (no test framework, no deps).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { uploadInChunks } from './chunkedUpload.js';
+import { uploadInChunks, slotAfterSubmit, keptSlotToDrop } from './chunkedUpload.js';
 
 const makeFile = (size, name = 'video.mp4') => {
   const file = new Blob([new Uint8Array(size)]);
@@ -203,4 +203,34 @@ test('a successful upload does not drop its slot', async () => {
   const srv = fakeServer(okPut);
   await uploadInChunks(makeFile(120), { fetchFn: srv.fetchFn, chunkSize: 50, sleep: noSleep });
   assert.ok(srv.calls.every((c) => c.init.method !== 'DELETE'));
+});
+
+// After /api/process: a slot left behind holds up to 2 GB for hours and counts
+// against the per-user cap, so only a 402's slot (handed back for reuse) stays.
+test('slotAfterSubmit: a generic failure deletes the slot', () => {
+  assert.equal(slotAfterSubmit({ uploadId: 'u1', failed: true, quota: false }), 'delete');
+});
+
+test('slotAfterSubmit: a 402 keeps the slot for the resend', () => {
+  assert.equal(slotAfterSubmit({ uploadId: 'u1', failed: true, quota: true }), 'keep');
+});
+
+test('slotAfterSubmit: a started job or no upload leaves nothing to do', () => {
+  assert.equal(slotAfterSubmit({ uploadId: 'u1', failed: false, quota: false }), null);
+  assert.equal(slotAfterSubmit({ uploadId: null, failed: true, quota: false }), null);
+  assert.equal(slotAfterSubmit({ uploadId: null, failed: true, quota: true }), null);
+});
+
+test('keptSlotToDrop: a different file replacing a kept slot drops the old one', () => {
+  const a = makeFile(10, 'a.mp4');
+  const b = makeFile(10, 'b.mp4');
+  assert.equal(keptSlotToDrop({ file: a, uploadId: 'old' }, b), 'old');
+  // A URL or Studio submit (no file) does not reuse it either.
+  assert.equal(keptSlotToDrop({ file: a, uploadId: 'old' }, null), 'old');
+});
+
+test('keptSlotToDrop: the same file reuses the kept slot; nothing kept, nothing to drop', () => {
+  const a = makeFile(10, 'a.mp4');
+  assert.equal(keptSlotToDrop({ file: a, uploadId: 'old' }, a), null);
+  assert.equal(keptSlotToDrop(null, a), null);
 });

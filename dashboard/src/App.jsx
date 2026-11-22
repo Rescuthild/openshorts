@@ -36,7 +36,7 @@ import { track } from './lib/analytics';
 import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
 import { rememberTabAfterLogin } from './lib/tabAfterLogin';
 import { JobPollError, pollFailureAction } from './lib/jobPoll';
-import { uploadInChunks } from './lib/chunkedUpload';
+import { uploadInChunks, slotAfterSubmit, keptSlotToDrop } from './lib/chunkedUpload';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -1246,6 +1246,11 @@ function App() {
   // server hands the slot back, so the quota wall's "clip the first N minutes"
   // resend reuses it instead of uploading the same file again.
   const refusedUploadRef = useRef(null); // { file, uploadId }
+  // Best effort: an unused slot otherwise holds the file until it expires and
+  // counts against the per-user slot cap.
+  const dropUploadSlot = (id) => {
+    apiFetch(`/api/uploads/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+  };
 
   const handleProcess = async (data, forceLowQuality = false) => {
     // Hosted: must be signed in AND on an active plan/trial. Self-host: BYOK keys.
@@ -1277,6 +1282,13 @@ function App() {
     setPartialJob(null);
     setFirstVideoJob(false);
 
+    // The file branch below covers every type but these two.
+    const file = data.type === 'url' || data.type === 'thumbnail_session' ? null : data.payload;
+    // A slot kept after a 402 that this submit will not reuse goes now.
+    const kept = refusedUploadRef.current;
+    refusedUploadRef.current = null;
+    const stale = keptSlotToDrop(kept, file);
+    if (stale) dropUploadSlot(stale);
     let uploadId = null;
     try {
       let body;
@@ -1326,10 +1338,8 @@ function App() {
       } else {
         // Files go up first in 50 MB chunks (Cloudflare refuses request bodies
         // over 100 MB), then the job starts from the upload_id.
-        const refused = refusedUploadRef.current;
-        refusedUploadRef.current = null;
-        if (refused && refused.file === data.payload) {
-          uploadId = refused.uploadId;
+        if (kept && !stale) {
+          uploadId = kept.uploadId;
         } else {
           setLogs(l => [...l, 'Yükleniyor %0']);
           setLogTimes(t => [...t, Date.now() / 1000]);
@@ -1376,10 +1386,12 @@ function App() {
       refreshMe();
 
     } catch (e) {
-      // A 402 from /api/process puts the uploaded file back in its slot.
-      if (e instanceof QuotaError && uploadId) {
-        refusedUploadRef.current = { file: data.payload, uploadId };
-      }
+      // A 402 from /api/process puts the uploaded file back in its slot, kept
+      // for the quota wall's resend; any other failure leaves an unused slot
+      // behind (a 404 once the server consumed it is harmless).
+      const slot = slotAfterSubmit({ uploadId, failed: true, quota: e instanceof QuotaError });
+      if (slot === 'keep') refusedUploadRef.current = { file, uploadId };
+      else if (slot === 'delete') dropUploadSlot(uploadId);
       if (e instanceof QuotaError && e.code === 'free_queue_full') {
         // The free queue is full: nothing was reserved or spent. Same plan
         // wall, its own copy and source so the funnel is measured apart.
