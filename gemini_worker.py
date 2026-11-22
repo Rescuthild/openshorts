@@ -67,6 +67,20 @@ class VisualResponse(BaseModel):
     shorts: List[VisualClipModel]
 
 
+# Parts mode: one request writes the hook, title and description of every
+# sequential part (parts.build_hooks_prompt). The "N. Part" label is added by
+# code, never by the model.
+class PartHook(BaseModel):
+    part: int
+    viral_hook_text: str
+    title: str
+    description: str = ""
+
+
+class PartHooksResponse(BaseModel):
+    parts: List[PartHook]
+
+
 VISUAL_PROMPT_TEMPLATE = """
 You are a senior short-form video editor. This video has NO speech/audio — judge
 it purely by what you SEE. Watch the whole thing and pick the {min_clips}–{max_clips} MOST engaging

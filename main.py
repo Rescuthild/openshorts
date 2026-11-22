@@ -30,6 +30,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import parts
 import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
@@ -2693,6 +2694,173 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         return None
 
 
+def get_part_hooks(transcript, ranges):
+    """Parts mode: hook, title and description for every part in ONE model
+    request (spec 2026-11-23-parts-mode §4). Returns
+    ``(parts.normalize_hooks(...), cost_analysis)``.
+
+    Never raises: a failed or policy-blocked request, or a missing key, leaves
+    the hooks empty (the parts still ship as "N. Part") with a warning. When
+    no part has any spoken words the model is not called at all."""
+    n = len(ranges)
+    model_name = (llm_backend.model_name() if llm_backend.active()
+                  else os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite')
+    cost_analysis = {"input_tokens": 0, "output_tokens": 0, "total_cost": 0.0,
+                     "model": model_name}
+    empty = parts.normalize_hooks(None, n)
+    try:
+        texts = parts.part_texts(transcript, ranges)
+        if not any(texts):
+            print("ℹ️ Parts: no spoken words; parts get no hooks (model not called).")
+            return empty, cost_analysis
+        language = str((transcript or {}).get("language") or "unknown")
+        if llm_backend.active():
+            client = None
+        else:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                print("⚠️ Parts: GEMINI_API_KEY not set; parts get no hooks.")
+                return empty, cost_analysis
+            client = genai.Client(api_key=api_key, http_options=gemini_http_options())
+        print(f"\U0001f916  Parts: writing hooks for {n} part(s) | model: {model_name} | language: {language}")
+        raw, cost = _run_gemini_stage(client, model_name, parts.build_hooks_prompt(language, texts),
+                                      gemini_worker.PartHooksResponse)
+        if cost:
+            cost_analysis.update(
+                input_tokens=cost.get("input_tokens", 0),
+                output_tokens=cost.get("output_tokens", 0),
+                total_cost=cost.get("total_cost", 0),
+                model=cost.get("model") or model_name)
+        # A silent part was not in the prompt (spec §2, §4): whatever the
+        # model wrote for its number is not grounded in it, so it stays empty.
+        hooks = [h if text else dict.fromkeys(h, "")
+                 for h, text in zip(parts.normalize_hooks(raw, n), texts)]
+        missing = sum(1 for h, text in zip(hooks, texts) if text and not h["viral_hook_text"])
+        if missing:
+            print(f"⚠️ Parts: model returned no hook for {missing}/{n} part(s); those keep only \"N. Part\".")
+        return hooks, cost_analysis
+    except Exception as e:  # GeminiBlockedError included: hooks are optional
+        print(f"⚠️ Parts: hook request failed, parts get no hooks: {e}")
+        return empty, cost_analysis
+
+
+def apply_parts_env(environ=os.environ):
+    """``--parts`` sets its own render flags (spec §2): app.py's per-job env is
+    not in the resume manifest, so a resumed parts job must not depend on it.
+    The hook carries the "N. Part" label; no extra Gemini or face calls."""
+    environ["AUTO_HOOK"] = "1"
+    environ["HOOK_GROUNDING"] = "0"
+    environ["PRO_MODE"] = "off"
+    environ["AUTO_LAYOUT"] = "0"
+
+
+def parts_force_strategy(width, height):
+    """The layout every part is pinned to (spec §5): WIDE keeps the full 16:9
+    frame on a blurred bed — nothing is cropped off the sides, unlike GENERAL.
+    A source already vertical gets None: the normal passthrough applies."""
+    from reframe_v2 import source_already_fits  # imports main back
+    if width and height and source_already_fits(width, height, ASPECT_RATIO):
+        return None
+    return "WIDE"
+
+
+def parts_framing(clips, strategy):
+    """Record the pinned WIDE layout as the clip editor's ``recipe.framing``
+    "full" (app.py ``_FRAMING_STRATEGIES``: "full" -> "WIDE"), so a re-render
+    from the source or a reframe keeps the full frame instead of running the
+    classifier again. A vertical source (``strategy`` None) gets no recipe."""
+    if strategy == "WIDE":
+        for clip in clips:
+            clip["recipe"] = {"framing": "full"}
+    return clips
+
+
+def parts_source_duration(input_video, fallback):
+    """The container duration (ffprobe) the parts are planned over, so the
+    last part ends at the real end of the file; OpenCV's frame count / fps
+    can be off on MKV. ``fallback`` (that estimate) on any probe problem."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", input_video],
+            capture_output=True, timeout=60)
+        value = float(proc.stdout.decode().strip()) if proc.returncode == 0 else 0.0
+        if math.isfinite(value) and value > 0:
+            return value
+    except Exception:
+        pass
+    return fallback
+
+
+def parts_prepare_scenes(input_video, output_dir, duration):
+    """Parts mode cuts on the scene changes too (build_parts), so the
+    whole-source probabilities are needed here. A checkpoint that already
+    belongs to this source (a resumed job) is reused; otherwise TransNetV2
+    runs once (prepare_scenes) and its result is loaded. True when
+    scene_detection holds validated probabilities for this source."""
+    import scene_detection
+    if scene_detection.use_prepared(output_dir, input_video, duration):
+        return True
+    prepare_scenes(input_video, output_dir)
+    return scene_detection.use_prepared(output_dir, input_video, duration)
+
+
+def parts_scene_cuts():
+    """Shot-boundary times (s) from the probabilities scene_detection.
+    use_prepared validated for THIS source (name and duration); ``[]`` when
+    none were loaded or they are unusable."""
+    import scene_detection
+    prepared = scene_detection.prepared_probabilities()
+    if prepared is None:
+        return []
+    try:
+        probs, fps = prepared
+        return parts.cut_times_from_probs(probs, fps)
+    except Exception:
+        return []
+
+
+def parts_burned_subtitles(input_video, environ=os.environ):
+    """Parts mode keeps a source's own burned-in subtitles (spec §5): when the
+    vision check finds them, no captions are added for this job. Not found, or
+    the check cannot run (SUBTITLE_BAND_CHECK=0, no GEMINI_API_KEY, an error):
+    our captions as usual. Skipped when captions are off anyway."""
+    if environ.get("AUTO_CAPTIONS", "1").strip() == "0":
+        return
+    try:
+        import burned_subtitles
+        if not burned_subtitles.ENABLED or not os.getenv("GEMINI_API_KEY"):
+            print("📝 Parts: subtitle check unavailable — adding captions.")
+            return
+        band = burned_subtitles.detect(input_video)
+    except Exception as e:
+        print(f"⚠️ Burned-in subtitle check skipped ({e}).")
+        print("📝 Parts: subtitle check unavailable — adding captions.")
+        return
+    if band is not None:
+        environ["AUTO_CAPTIONS"] = "0"
+        print("📝 Parts: source has burned-in subtitles — keeping them, no captions added.")
+    else:
+        print("📝 Parts: no burned-in subtitles — adding captions.")
+
+
+def build_parts(transcript, duration, part_seconds):
+    """``--parts``: the whole video as sequential parts (spec §3) in the
+    ``get_viral_clips`` shape, ``{"shorts": [...], "cost_analysis": {...}}``."""
+    import clip_selection
+    ranges = parts.plan_parts(duration, part_seconds,
+                              parts.words_from_transcript(transcript),
+                              parts.sentence_end_times(transcript),
+                              parts_scene_cuts(),
+                              max_parts=clip_selection.max_clips_per_job())
+    if ranges and ranges[-1][1] < float(duration):
+        print(f"⚠️ Parts: capped at {len(ranges)} parts — the video after "
+              f"{ranges[-1][1]:.0f}s is not produced.")
+    print(f"✂️ Parts: {len(ranges)} part(s) of ~{part_seconds}s.")
+    hooks, cost_analysis = get_part_hooks(transcript, ranges)
+    return {"shorts": parts.build_part_clips(ranges, hooks), "cost_analysis": cost_analysis}
+
+
 # --- Speech too sparse to clip by transcript -------------------------------
 # The vision path used to fire only on a missing audio TRACK. A nursery-rhyme
 # video or a dashcam drive has audio, so it went through transcription, came
@@ -2943,9 +3111,17 @@ if __name__ == '__main__':
     parser.add_argument('--prepare-only', action='store_true',
                         help="Fetch the source (download, cut to the paid minutes), print "
                              "SOURCE_READY <path> and exit: a remote worker renders it.")
+    parser.add_argument('--parts', type=int, metavar='SECONDS',
+                        help=f"Cut the whole video into sequential parts of about SECONDS "
+                             f"({parts.MIN_PART_SECONDS}-{parts.MAX_PART_SECONDS}) instead "
+                             f"of picking clips.")
 
     args = parser.parse_args()
     output_format = args.format
+    if args.parts is not None:
+        if not parts.MIN_PART_SECONDS <= args.parts <= parts.MAX_PART_SECONDS:
+            parser.error(f"--parts must be {parts.MIN_PART_SECONDS}-{parts.MAX_PART_SECONDS} seconds")
+        apply_parts_env()
 
     script_start_time = time.time()
 
@@ -3067,7 +3243,7 @@ if __name__ == '__main__':
                              daemon=True).start()
 
         use_early = (not args.skip_analysis and not args.transcript
-                     and not args.prepare_only
+                     and not args.prepare_only and not args.parts
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
@@ -3129,7 +3305,7 @@ if __name__ == '__main__':
     # instead of one per clip, and the answer is a property of the material
     # ("this is a screencast"), which does not change between its own clips.
     # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
+    if layout_picker.ENABLED and not args.parts:
         try:
             _cap = cv2.VideoCapture(input_video)
             _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -3152,7 +3328,11 @@ if __name__ == '__main__':
     # our captions are the only text layer (burned_subtitles.py). Only when we
     # caption at all, and never on a vertical source, which is passed through.
     source_subtitle_band = None
-    if (not args.skip_analysis
+    if args.parts:
+        # Parts keep the source's own subtitles instead (never cropped).
+        if not args.skip_analysis:
+            parts_burned_subtitles(input_video)
+    elif (not args.skip_analysis
             and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
         try:
             import burned_subtitles
@@ -3187,7 +3367,12 @@ if __name__ == '__main__':
         # Scene probabilities the GPU host prepared for this source (a remote
         # worker's job): the clips map them instead of running TransNetV2.
         import scene_detection
-        scene_detection.use_prepared(output_dir, input_video, duration)
+        if args.parts:
+            # The parts are cut on the scene changes too (build_parts); a
+            # resumed job reuses the checkpoint it already prepared.
+            parts_prepare_scenes(input_video, output_dir, duration)
+        else:
+            scene_detection.use_prepared(output_dir, input_video, duration)
 
         # 3. Transcribe — unless the video has no audio, in which case fall back
         # to Gemini vision (picks clips from the imagery instead of the speech).
@@ -3245,7 +3430,8 @@ if __name__ == '__main__':
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
-        if transcript is not None and speech_is_sparse(transcript, duration):
+        # Parts mode keeps the few words there are: captions and hooks.
+        if transcript is not None and not args.parts and speech_is_sparse(transcript, duration):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
             print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
                   f"switching to visual analysis.")
@@ -3253,7 +3439,12 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
+        if args.parts:
+            # Planned over the container duration so the last part ends at
+            # the real end of the file (OpenCV's estimate can be off on MKV).
+            clips_data = build_parts(transcript, parts_source_duration(input_video, duration),
+                                     args.parts)
+        elif (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
@@ -3282,6 +3473,15 @@ if __name__ == '__main__':
             clips_data['output_format'] = output_format
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band
+            # Parts are pinned to one layout (spec §5); the metadata records
+            # it so the clip editor's re-renders keep it.
+            parts_strategy = None
+            if args.parts:
+                _cap = cv2.VideoCapture(input_video)
+                parts_strategy = parts_force_strategy(int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                                                      int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                _cap.release()
+                parts_framing(clips_data['shorts'], parts_strategy)
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             write_json_atomic(metadata_file, clips_data, indent=2)
             print(f"   Saved metadata to {metadata_file}")
@@ -3289,6 +3489,7 @@ if __name__ == '__main__':
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
+
             def _process_one_clip(i, clip):
                 if clip.get('pro_before'):
                     # A retry of a clip whose first attempt got as far as pro
@@ -3319,6 +3520,7 @@ if __name__ == '__main__':
                     # made. Each worker writes only its own clip dict, so the
                     # re-dump after the pool is race-free.
                     success = render_clip(clip_temp_path, clip_final_path, output_format,
+                                          force_strategy=parts_strategy,
                                           subtitle_band=source_subtitle_band)
                     if success:
                         print(f"   🎞️ Clip {i+1} framed")
@@ -3330,14 +3532,16 @@ if __name__ == '__main__':
                     # The hook was written from the transcript alone. When the
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
-                    if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
+                    if (success and not args.parts
+                            and hook_grounding.wanted(clip['layout_ranges'], end - start)):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
                     captioned = None
                     # Pro mode replaces the file the hook and the captions go
                     # on, and the timeline they are laid on (its cuts); the
                     # canonical reframe stays, it is the clip's normal mode.
                     base_path, words, w_start, w_end = clip_final_path, transcript, start, end
-                    pro = pro_clip(clip_final_path, clip, transcript) if success else None
+                    pro = (pro_clip(clip_final_path, clip, transcript)
+                           if success and not args.parts else None)
                     cap_style = None
                     if pro:
                         deliver_path = base_path = pro[0]

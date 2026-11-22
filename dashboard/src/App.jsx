@@ -36,6 +36,8 @@ import { track } from './lib/analytics';
 import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
 import { rememberTabAfterLogin } from './lib/tabAfterLogin';
 import { JobPollError, pollFailureAction } from './lib/jobPoll';
+import { uploadInChunks, slotAfterSubmit, keptSlotToDrop } from './lib/chunkedUpload';
+import { sentAdvancedParams } from './lib/advancedParams';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -1241,6 +1243,16 @@ function App() {
     }
   };
 
+  // A file already uploaded whose /api/process was refused with a 402: the
+  // server hands the slot back, so the quota wall's "clip the first N minutes"
+  // resend reuses it instead of uploading the same file again.
+  const refusedUploadRef = useRef(null); // { file, uploadId }
+  // Best effort: an unused slot otherwise holds the file until it expires and
+  // counts against the per-user slot cap.
+  const dropUploadSlot = (id) => {
+    apiFetch(`/api/uploads/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+  };
+
   const handleProcess = async (data, forceLowQuality = false) => {
     // Hosted: must be signed in AND on an active plan/trial. Self-host: BYOK keys.
     if (billingEnabled) {
@@ -1271,6 +1283,14 @@ function App() {
     setPartialJob(null);
     setFirstVideoJob(false);
 
+    // The file branch below covers every type but these two.
+    const file = data.type === 'url' || data.type === 'thumbnail_session' ? null : data.payload;
+    // A slot kept after a 402 that this submit will not reuse goes now.
+    const kept = refusedUploadRef.current;
+    refusedUploadRef.current = null;
+    const stale = keptSlotToDrop(kept, file);
+    if (stale) dropUploadSlot(stale);
+    let uploadId = null;
     try {
       let body;
       // BYOK sends the Gemini header; managed users rely on the bearer token
@@ -1279,23 +1299,7 @@ function App() {
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
-      const advanced = {
-        target_clips: data.targetClips || null,
-        clip_min_seconds: data.clipMinSeconds || null,
-        clip_max_seconds: data.clipMaxSeconds || null,
-        // Sent explicitly both ways: absent means off for raw API callers,
-        // but the dashboard always states the user's choice.
-        auto_hook: data.autoHook ? '1' : '0',
-        auto_hook_style: data.autoHook ? (data.autoHookStyle || 'pill') : null,
-        // 'auto' is the server default, so only a deliberate choice travels.
-        layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
-        // Set when the user took the quota wall's "clip the first N minutes"
-        // offer: the server reserves N minutes and cuts the source to them.
-        max_minutes: data.maxMinutes || null,
-        // The stretch picked under the cost line (seconds); absent = whole video.
-        source_start: data.sourceStart ?? null,
-        source_end: data.sourceEnd ?? null,
-      };
+      const advanced = sentAdvancedParams(data);
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
@@ -1304,7 +1308,7 @@ function App() {
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
           force_low_quality: forceLowQuality,
-          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+          ...advanced,
         });
       } else if (data.type === 'thumbnail_session') {
         // Handover from Thumbnail Studio (issue #68): the video and transcript
@@ -1314,17 +1318,28 @@ function App() {
           thumbnail_session_id: data.payload,
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
-          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+          ...advanced,
         });
       } else {
-        const formData = new FormData();
-        formData.append('file', data.payload);
-        formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
-        formData.append('output_format', data.outputFormat || 'auto');
-        for (const [k, v] of Object.entries(advanced)) {
-          if (v != null) formData.append(k, v);
+        // Files go up first in 50 MB chunks (Cloudflare refuses request bodies
+        // over 100 MB), then the job starts from the upload_id.
+        if (kept && !stale) {
+          uploadId = kept.uploadId;
+        } else {
+          setLogs(l => [...l, 'Yükleniyor %0']);
+          setLogTimes(t => [...t, Date.now() / 1000]);
+          uploadId = await uploadInChunks(data.payload, {
+            fetchFn: apiFetch,
+            onProgress: (p) => setLogs(l => [...l.slice(0, -1), `Yükleniyor %${Math.floor(p * 100)}`]),
+          });
         }
-        body = formData;
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({
+          upload_id: uploadId,
+          acknowledged: !!data.acknowledged,
+          output_format: data.outputFormat || 'auto',
+          ...advanced,
+        });
       }
 
       const res = await apiFetch('/api/process', { method: 'POST', headers, body });
@@ -1356,6 +1371,12 @@ function App() {
       refreshMe();
 
     } catch (e) {
+      // A 402 from /api/process puts the uploaded file back in its slot, kept
+      // for the quota wall's resend; any other failure leaves an unused slot
+      // behind (a 404 once the server consumed it is harmless).
+      const slot = slotAfterSubmit({ uploadId, failed: true, quota: e instanceof QuotaError });
+      if (slot === 'keep') refusedUploadRef.current = { file, uploadId };
+      else if (slot === 'delete') dropUploadSlot(uploadId);
       if (e instanceof QuotaError && e.code === 'free_queue_full') {
         // The free queue is full: nothing was reserved or spent. Same plan
         // wall, its own copy and source so the funnel is measured apart.

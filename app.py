@@ -5963,11 +5963,31 @@ def _remove_if_present(path):
 @app.put("/api/uploads/{upload_id}")
 async def put_upload(upload_id: str, request: Request):
     """Receive the raw video body for a reserved slot. Streams to disk, capped
-    at MAX_FILE_SIZE_MB; a second PUT replaces the first."""
+    at MAX_FILE_SIZE_MB; a second PUT replaces the first.
+
+    With ``?offset=N`` the body is one chunk of the file instead (the dashboard
+    sends 50 MB chunks: Cloudflare refuses bodies over 100 MB); ``&size=TOTAL``
+    on the last chunk closes the upload."""
     slot = pending_uploads.get(upload_id)
     if not slot or time.time() - slot["created"] > UPLOAD_TTL_SECONDS:
         pending_uploads.pop(upload_id, None)
         raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    # One write per slot at a time: a retry that overlaps a request still
+    # streaming (or a whole-body PUT racing a chunk) would interleave bytes,
+    # and the aborted one's cleanup would cut what the other wrote.
+    if slot.get("busy"):
+        raise HTTPException(status_code=409, detail="upload in progress")
+    slot["busy"] = True
+    try:
+        if "offset" in request.query_params:
+            return await _put_upload_chunk(upload_id, slot, request)
+        return await _put_upload_whole(upload_id, slot, request)
+    finally:
+        slot.pop("busy", None)
+
+
+async def _put_upload_whole(upload_id, slot, request):
+    """The whole video in one body: replaces whatever the slot held."""
     limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     size = 0
     with open(slot["path"], "wb") as out:
@@ -5989,6 +6009,77 @@ async def put_upload(upload_id: str, request: Request):
         raise HTTPException(status_code=400, detail="The body is not a readable video file")
     return {"upload_id": upload_id, "bytes": size, "duration_seconds": round(duration, 1),
             "hint": "Now call /api/process with upload_id."}
+
+
+def _upload_query_int(params, name):
+    """A non-negative integer query parameter, None when absent, else 400."""
+    raw = params.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    return value
+
+
+async def _put_upload_chunk(upload_id, slot, request):
+    """One chunk of a slot's file, appended at ``offset`` (the contract of the
+    remote worker's chunk upload): it must start where the last chunk ended,
+    and offset 0 starts over. ``slot["bytes"]`` is what is on disk. The chunk
+    carrying ``size`` must make the file exactly that long; it completes the
+    slot and runs the duration probe. A completed slot only takes offset 0.
+    The caller (put_upload) holds the slot's busy flag, so this is the file's
+    only writer and its real size is the offset to continue from."""
+    offset = _upload_query_int(request.query_params, "offset")
+    size = _upload_query_int(request.query_params, "size")
+    path = slot["path"]
+    try:
+        have = os.path.getsize(path)
+    except OSError:
+        have = 0
+    slot["bytes"] = have
+    if offset != 0 and (offset != have or slot.get("complete")):
+        raise HTTPException(status_code=409, detail=f"expected offset {have}")
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    if offset == 0:
+        slot.update({"bytes": 0, "complete": False})
+    with open(path, "wb" if offset == 0 else "ab") as out:
+        try:
+            async for chunk in request.stream():
+                # The cap is on the file, not on this request's share of it.
+                if out.tell() + len(chunk) > limit_bytes:
+                    out.close()
+                    _remove_if_present(path)
+                    slot.update({"bytes": 0, "complete": False})
+                    raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                out.write(chunk)
+            received = out.tell()
+        except HTTPException:
+            raise
+        except BaseException:
+            # A chunk cut off midway is dropped whole, so the file stays the
+            # length the slot records and the retry starts at the same offset.
+            out.truncate(offset)
+            raise
+    if received == offset:
+        raise HTTPException(status_code=400, detail="Empty body")
+    slot["bytes"] = received
+    result = {"upload_id": upload_id, "received": received, "complete": False}
+    if size is None:
+        return result
+    if received != size:
+        raise HTTPException(status_code=400, detail="size mismatch")
+    duration = await asyncio.get_event_loop().run_in_executor(None, _media_duration_seconds, path)
+    if duration <= 0:
+        _remove_if_present(path)
+        slot.update({"bytes": 0, "complete": False})
+        raise HTTPException(status_code=400, detail="The body is not a readable video file")
+    slot["complete"] = True
+    result.update({"complete": True, "duration_seconds": round(duration, 1)})
+    return result
 
 
 @app.delete("/api/uploads/{upload_id}")
@@ -6151,6 +6242,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),
+    part_seconds: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -6185,6 +6278,8 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        mode = body.get("mode")
+        part_seconds = body.get("part_seconds")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -6195,6 +6290,36 @@ async def process_endpoint(
         layouts = [p for p in layouts.split(",") if p.strip()]
     elif not isinstance(layouts, list):
         layouts = []
+
+    # Numeric request fields: a bad value 400s instead of silently producing
+    # something the user didn't ask for (the generation controls below too).
+    def _gen_control(raw, name, lo, hi, integer=False):
+        if raw in (None, ""):
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if not math.isfinite(val):  # "inf"/"nan": int(val) would raise -> 500
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if integer and val != int(val):
+            raise HTTPException(status_code=400, detail=f"{name} must be an integer")
+        if not (lo <= val <= hi):
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must be between {lo:g} and {hi:g}")
+        return int(val) if integer else val
+
+    # mode=parts (spec 2026-11-23-parts-mode §1): the whole video as sequential
+    # parts of about part_seconds each. Checked here, before the job dir, the
+    # upload file or an agent upload slot is touched. part_seconds outside
+    # parts mode is ignored, so the dashboard can always send it.
+    if mode in (None, ""):
+        mode = "clips"
+    if mode not in ("clips", "parts"):
+        raise HTTPException(status_code=400, detail='mode must be "clips" or "parts"')
+    parts_mode = mode == "parts"
+    if parts_mode:
+        part_seconds = _gen_control(part_seconds, "part_seconds", 30, 180, integer=True)
 
     # Module handover (issue #68): reuse the Thumbnail Studio source video and
     # its transcript so publishing to YouTube can flow straight into clip
@@ -6279,7 +6404,8 @@ async def process_endpoint(
     # Optional layouts are per job. The renderer reads these at import time in
     # the subprocess, so they must be set before Popen — same path WATERMARK
     # already takes.
-    chosen = layout_env(layouts)
+    # Parts mode renders WIDE parts: no layout module is switched on.
+    chosen = {} if parts_mode else layout_env(layouts)
     env.update(chosen)
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
@@ -6300,20 +6426,10 @@ async def process_endpoint(
     # are honest TARGETS, not guarantees — the model may return fewer clips
     # when the material doesn't hold them. Bad values 400 instead of silently
     # producing something the user didn't ask for.
-    def _gen_control(raw, name, lo, hi, integer=False):
-        if raw in (None, ""):
-            return None
-        try:
-            val = float(raw)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"{name} must be a number")
-        if integer and val != int(val):
-            raise HTTPException(status_code=400, detail=f"{name} must be an integer")
-        if not (lo <= val <= hi):
-            raise HTTPException(status_code=400,
-                                detail=f"{name} must be between {lo:g} and {hi:g}")
-        return int(val) if integer else val
-
+    # (_gen_control is defined above, next to the mode check.) Parts mode cuts
+    # the whole video, so count and band are ignored there, not validated.
+    if parts_mode:
+        target_clips = clip_min_seconds = clip_max_seconds = None
     n_clips = _gen_control(target_clips, "target_clips", 1, 15, integer=True)
     min_secs = _gen_control(clip_min_seconds, "clip_min_seconds", 5, 175)
     max_secs = _gen_control(clip_max_seconds, "clip_max_seconds", 10, 180)
@@ -6405,6 +6521,16 @@ async def process_endpoint(
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
         cmd.extend(["--format", output_format])
+    if parts_mode:
+        # Last in cmd, so it rides the resume manifest; main.py applies the
+        # same render flags itself on resume (this env is not persisted), so
+        # here they only back up the first run: the hook/Part title is part of
+        # this mode, and no extra Gemini or face pass runs.
+        cmd.extend(["--parts", str(part_seconds or 60)])
+        env["AUTO_HOOK"] = "1"
+        env["HOOK_GROUNDING"] = "0"
+        env["PRO_MODE"] = "off"
+        print(f"[parts] job={job_id} part_seconds={part_seconds or 60}")
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
 
