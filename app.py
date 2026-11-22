@@ -5963,11 +5963,17 @@ def _remove_if_present(path):
 @app.put("/api/uploads/{upload_id}")
 async def put_upload(upload_id: str, request: Request):
     """Receive the raw video body for a reserved slot. Streams to disk, capped
-    at MAX_FILE_SIZE_MB; a second PUT replaces the first."""
+    at MAX_FILE_SIZE_MB; a second PUT replaces the first.
+
+    With ``?offset=N`` the body is one chunk of the file instead (the dashboard
+    sends 50 MB chunks: Cloudflare refuses bodies over 100 MB); ``&size=TOTAL``
+    on the last chunk closes the upload."""
     slot = pending_uploads.get(upload_id)
     if not slot or time.time() - slot["created"] > UPLOAD_TTL_SECONDS:
         pending_uploads.pop(upload_id, None)
         raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
+    if "offset" in request.query_params:
+        return await _put_upload_chunk(upload_id, slot, request)
     limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     size = 0
     with open(slot["path"], "wb") as out:
@@ -5989,6 +5995,72 @@ async def put_upload(upload_id: str, request: Request):
         raise HTTPException(status_code=400, detail="The body is not a readable video file")
     return {"upload_id": upload_id, "bytes": size, "duration_seconds": round(duration, 1),
             "hint": "Now call /api/process with upload_id."}
+
+
+def _upload_query_int(params, name):
+    """A non-negative integer query parameter, None when absent, else 400."""
+    raw = params.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-negative integer")
+    return value
+
+
+async def _put_upload_chunk(upload_id, slot, request):
+    """One chunk of a slot's file, appended at ``offset`` (the contract of the
+    remote worker's chunk upload): it must start where the last chunk ended,
+    and offset 0 starts over. ``slot["bytes"]`` is what is on disk. The chunk
+    carrying ``size`` must make the file exactly that long; it completes the
+    slot and runs the duration probe. A completed slot only takes offset 0."""
+    offset = _upload_query_int(request.query_params, "offset")
+    size = _upload_query_int(request.query_params, "size")
+    path = slot["path"]
+    have = slot["bytes"] if os.path.exists(path) else 0
+    if offset != 0 and (offset != have or slot.get("complete")):
+        slot["bytes"] = have
+        raise HTTPException(status_code=409, detail=f"expected offset {have}")
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    if offset == 0:
+        slot.update({"bytes": 0, "complete": False})
+    received = offset
+    with open(path, "wb" if offset == 0 else "ab") as out:
+        try:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > limit_bytes:
+                    out.close()
+                    _remove_if_present(path)
+                    slot.update({"bytes": 0, "complete": False})
+                    raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                out.write(chunk)
+        except HTTPException:
+            raise
+        except BaseException:
+            # A chunk cut off midway is dropped whole, so the file stays the
+            # length the slot records and the retry starts at the same offset.
+            out.truncate(offset)
+            raise
+    if received == offset:
+        raise HTTPException(status_code=400, detail="Empty body")
+    slot["bytes"] = received
+    result = {"upload_id": upload_id, "received": received, "complete": False}
+    if size is None:
+        return result
+    if received != size:
+        raise HTTPException(status_code=400, detail="size mismatch")
+    duration = await asyncio.get_event_loop().run_in_executor(None, _media_duration_seconds, path)
+    if duration <= 0:
+        _remove_if_present(path)
+        slot.update({"bytes": 0, "complete": False})
+        raise HTTPException(status_code=400, detail="The body is not a readable video file")
+    slot["complete"] = True
+    result.update({"complete": True, "duration_seconds": round(duration, 1)})
+    return result
 
 
 @app.delete("/api/uploads/{upload_id}")
