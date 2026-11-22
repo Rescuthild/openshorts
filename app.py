@@ -6300,6 +6300,8 @@ async def process_endpoint(
             val = float(raw)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if not math.isfinite(val):  # "inf"/"nan": int(val) would raise -> 500
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
         if integer and val != int(val):
             raise HTTPException(status_code=400, detail=f"{name} must be an integer")
         if not (lo <= val <= hi):

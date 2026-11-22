@@ -96,7 +96,7 @@ def test_parts_flag_comes_after_format(dirs):
     assert cmd[-4:] == ["--format", "vertical", "--parts", "60"]
 
 
-@pytest.mark.parametrize("bad", [29, 181, 60.5, "abc"])
+@pytest.mark.parametrize("bad", [29, 181, 60.5, "abc", "inf", "-inf", "nan"])
 def test_part_seconds_out_of_range_is_400(dirs, bad):
     _assert_refused(dirs, _post(json={"url": URL, "acknowledged": True,
                                       "mode": "parts", "part_seconds": bad}))
@@ -163,3 +163,14 @@ def test_multipart_bad_part_seconds_writes_nothing(dirs):
     resp = _post(data={"acknowledged": "true", "mode": "parts", "part_seconds": "200"},
                  files={"file": ("talk.mp4", b"\x00" * 1000, "video/mp4")})
     _assert_refused(dirs, resp)
+
+
+def test_full_framing_is_the_wide_render_and_needs_no_segments():
+    # Parts of a 16:9 source carry recipe.framing = "full" (main.py,
+    # parts_framing): it must map to the WIDE full-frame render, and a recipe
+    # with only a framing must still yield the clip's own range.
+    assert app_module._FRAMING_STRATEGIES["full"] == "WIDE"
+    segments, canonical = app_module._clip_recipe_parts(
+        {"start": 60.0, "end": 118.5, "recipe": {"framing": "full"}})
+    assert segments == [{"start": 60.0, "end": 118.5}]
+    assert canonical == {"start": 60.0, "end": 118.5}
