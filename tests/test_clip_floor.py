@@ -56,7 +56,7 @@ def _run(monkeypatch, detail_responses):
 
     monkeypatch.setattr(main, "_run_gemini_stage", fake_stage)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(main.genai, "Client", lambda api_key=None: object())
+    monkeypatch.setattr(main.genai, "Client", lambda api_key=None, **kw: object())
     out = main.get_viral_clips(_transcript(), 600.0)
     return (out or {}).get("shorts", []), calls
 
@@ -125,7 +125,7 @@ def _run_long(monkeypatch, minutes, per_window=1):
 
     monkeypatch.setattr(main, "_run_gemini_stage", fake_stage)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(main.genai, "Client", lambda api_key=None: object())
+    monkeypatch.setattr(main.genai, "Client", lambda api_key=None, **kw: object())
     seconds = minutes * 60.0
     out = main.get_viral_clips(_transcript(int(seconds // 15)), seconds)
     return (out or {}).get("shorts", []), calls
