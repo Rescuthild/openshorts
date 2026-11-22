@@ -6151,6 +6151,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),
+    part_seconds: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -6185,6 +6187,8 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        mode = body.get("mode")
+        part_seconds = body.get("part_seconds")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -6195,6 +6199,34 @@ async def process_endpoint(
         layouts = [p for p in layouts.split(",") if p.strip()]
     elif not isinstance(layouts, list):
         layouts = []
+
+    # Numeric request fields: a bad value 400s instead of silently producing
+    # something the user didn't ask for (the generation controls below too).
+    def _gen_control(raw, name, lo, hi, integer=False):
+        if raw in (None, ""):
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if integer and val != int(val):
+            raise HTTPException(status_code=400, detail=f"{name} must be an integer")
+        if not (lo <= val <= hi):
+            raise HTTPException(status_code=400,
+                                detail=f"{name} must be between {lo:g} and {hi:g}")
+        return int(val) if integer else val
+
+    # mode=parts (spec 2026-11-23-parts-mode §1): the whole video as sequential
+    # parts of about part_seconds each. Checked here, before the job dir, the
+    # upload file or an agent upload slot is touched. part_seconds outside
+    # parts mode is ignored, so the dashboard can always send it.
+    if mode in (None, ""):
+        mode = "clips"
+    if mode not in ("clips", "parts"):
+        raise HTTPException(status_code=400, detail='mode must be "clips" or "parts"')
+    parts_mode = mode == "parts"
+    if parts_mode:
+        part_seconds = _gen_control(part_seconds, "part_seconds", 30, 180, integer=True)
 
     # Module handover (issue #68): reuse the Thumbnail Studio source video and
     # its transcript so publishing to YouTube can flow straight into clip
@@ -6279,7 +6311,8 @@ async def process_endpoint(
     # Optional layouts are per job. The renderer reads these at import time in
     # the subprocess, so they must be set before Popen — same path WATERMARK
     # already takes.
-    chosen = layout_env(layouts)
+    # Parts mode renders WIDE parts: no layout module is switched on.
+    chosen = {} if parts_mode else layout_env(layouts)
     env.update(chosen)
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
@@ -6300,20 +6333,10 @@ async def process_endpoint(
     # are honest TARGETS, not guarantees — the model may return fewer clips
     # when the material doesn't hold them. Bad values 400 instead of silently
     # producing something the user didn't ask for.
-    def _gen_control(raw, name, lo, hi, integer=False):
-        if raw in (None, ""):
-            return None
-        try:
-            val = float(raw)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"{name} must be a number")
-        if integer and val != int(val):
-            raise HTTPException(status_code=400, detail=f"{name} must be an integer")
-        if not (lo <= val <= hi):
-            raise HTTPException(status_code=400,
-                                detail=f"{name} must be between {lo:g} and {hi:g}")
-        return int(val) if integer else val
-
+    # (_gen_control is defined above, next to the mode check.) Parts mode cuts
+    # the whole video, so count and band are ignored there, not validated.
+    if parts_mode:
+        target_clips = clip_min_seconds = clip_max_seconds = None
     n_clips = _gen_control(target_clips, "target_clips", 1, 15, integer=True)
     min_secs = _gen_control(clip_min_seconds, "clip_min_seconds", 5, 175)
     max_secs = _gen_control(clip_max_seconds, "clip_max_seconds", 10, 180)
@@ -6405,6 +6428,16 @@ async def process_endpoint(
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
         cmd.extend(["--format", output_format])
+    if parts_mode:
+        # Last in cmd, so it rides the resume manifest; main.py applies the
+        # same render flags itself on resume (this env is not persisted), so
+        # here they only back up the first run: the hook/Part title is part of
+        # this mode, and no extra Gemini or face pass runs.
+        cmd.extend(["--parts", str(part_seconds or 60)])
+        env["AUTO_HOOK"] = "1"
+        env["HOOK_GROUNDING"] = "0"
+        env["PRO_MODE"] = "off"
+        print(f"[parts] job={job_id} part_seconds={part_seconds or 60}")
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
 
