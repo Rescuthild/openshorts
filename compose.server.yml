@@ -1,0 +1,90 @@
+# gpu-coolify için OpenShorts (self-host, BYOK).
+# Repodaki docker-compose.yml KULLANILMAZ: 8000 portu Coolify ile çakışır ve
+# kaynak bind-mount Linux'ta appuser izinlerini bozar.
+# Frontend sadece OPENSHORTS_BIND adresine açılır (sunucuda .env: Tailscale IP);
+# self-host modunda login yok, dış erişim Traefik basic auth arkasında.
+#   cd /opt/openshorts && docker compose -f compose.server.yml up -d --build
+name: openshorts
+services:
+  backend:
+    build:
+      context: .
+      args:
+        GPU: "1"
+    container_name: openshorts-backend
+    environment:
+      # large-v3 (turbo değil): Türkçe transkriptte daha az hata, ~2x yavaş, VRAM ~4 GB.
+      WHISPER_MODEL: large-v3
+      # Ücretsiz Gemini katmanı: 3.5 Flash Lite = 15 RPM / 500 RPD.
+      # 3.8 Flash denendi (2026-11-19): 20 RPD + ücretsiz katmanda 503 "high demand",
+      # istemcide timeout olmadığı için istek başına ~4 dk asılı kaldı.
+      GEMINI_MODEL: gemini-3.5-flash-lite
+      # Fork yaması (main.py _run_gemini_stage):
+      # ana model 3 denemede de 503/429/timeout verirse sıradakine geçer (her modelin kotası ayrı).
+      GEMINI_FALLBACK_MODELS: gemini-3.1-flash-lite,gemini-2.5-flash-lite
+      GEMINI_RETRY_BASE_SECONDS: "15"   # 15 sn, sonra 30 sn (upstream: 5, 10)
+      GEMINI_TIMEOUT_SECONDS: "120"     # istek başına; yoksa 503 ~4 dk asılı kalabiliyor
+      WHISPER_DEVICE: cuda
+      # int8_float16: large-v3'ün VRAM'i ~yarıya iner. 2026-11-20'de 8s50dk'lık yayın
+      # float16'da OOM verip CPU'ya düştü (kart whisperx ile paylaşılıyor, ~4 GB onda).
+      WHISPER_COMPUTE: int8_float16
+      # İş klasörü disk sınırı (varsayılan 25 GB): aşınca eski işler siliniyor.
+      # 17 GB'lık yayın 2026-11-20'de 5 işin kliplerini sildirdi. Sunucuda ~300 GB boş.
+      OUTPUT_MAX_GB: "150"
+      FFMPEG_ENCODER: auto
+      ASR_GPU_CONCURRENCY: "1"
+      MAX_CONCURRENT_JOBS: "1"
+    volumes:
+      - output:/app/output
+      - hf-cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./dashboard
+      target: dev
+    container_name: openshorts-frontend
+    ports:
+      - "${OPENSHORTS_BIND:-127.0.0.1}:5175:5173"
+    # coolify ağı: Traefik (coolify-proxy) shorts.saviordigital.com'u buraya yollar
+    # (/data/coolify/proxy/dynamic/openshorts.yml, basic auth'lu).
+    networks:
+      - default
+      - coolify
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  # Kapalı (profile): upstream'de remotion/ 4.0.541, render-service 4.0.446'ya
+  # sabitli -> bundle "export 'Interactive' was not found" ile çöküyor. Dashboard
+  # ve MCP /api/render'ı kullanmıyor. Açmak için: --profile renderer
+  renderer:
+    profiles: [renderer]
+    build:
+      context: .
+      dockerfile: render-service/Dockerfile
+    container_name: openshorts-renderer
+    volumes:
+      - output:/output
+    environment:
+      REMOTION_BUNDLE_PATH: /app/remotion
+      OUTPUT_DIR: /output
+      PORT: "3100"
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+volumes:
+  output:
+  hf-cache:
+
+networks:
+  coolify:
+    external: true
