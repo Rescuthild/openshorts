@@ -225,8 +225,9 @@ def part_texts(transcript: dict | None, ranges: list[tuple[float, float]],
 
 def build_hooks_prompt(language: str, texts: list[str]) -> str:
     """The single hooks request for every part's text (``texts[i]`` is part
-    ``i + 1``)."""
-    payload = [{"part": i + 1, "text": t or "(no speech)"} for i, t in enumerate(texts)]
+    ``i + 1``). A part without speech is left out (spec §2: no text is sent
+    for it); the others keep their own part numbers."""
+    payload = [{"part": i + 1, "text": t} for i, t in enumerate(texts) if t]
     return HOOKS_PROMPT_TEMPLATE.format(
         n=len(texts), language=language or "unknown",
         parts_json=json.dumps(payload, ensure_ascii=False, indent=1))

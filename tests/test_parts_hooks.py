@@ -67,7 +67,7 @@ def test_get_part_hooks_prompt_carries_language_and_part_texts(monkeypatch):
     monkeypatch.setattr(main, "_run_gemini_stage", fake)
     main.get_part_hooks(TRANSCRIPT, [(0, 60), (60, 120)])
     assert len(prompts) == 1
-    assert "tr" in prompts[0]
+    assert 'language is "tr"' in prompts[0]
     assert "birinci" in prompts[0] and "ikinci" in prompts[0]
 
 
@@ -142,4 +142,54 @@ def test_part_texts_splits_words_by_range_and_truncates():
 
 def test_prompt_mentions_language_and_every_part():
     p = parts.build_hooks_prompt("tr", ["birinci", "ikinci"])
-    assert "tr" in p and "birinci" in p and "ikinci" in p
+    assert 'language is "tr"' in p and "birinci" in p and "ikinci" in p
+
+
+def _prompt_parts(prompt):
+    import json
+    return json.loads(prompt.split("PARTS_JSON:")[-1])
+
+
+def test_prompt_leaves_silent_parts_out_and_keeps_numbering():
+    # Spec §2: no text goes to the model for a part without speech.
+    p = parts.build_hooks_prompt("tr", ["birinci", "", "üçüncü"])
+    assert _prompt_parts(p) == [{"part": 1, "text": "birinci"},
+                                {"part": 3, "text": "üçüncü"}]
+    assert "no speech" not in p
+
+
+SILENT_MIDDLE = {
+    "language": "tr",
+    "segments": [_segment(0.0, ["birinci", "parça."]),
+                 _segment(130.0, ["üçüncü", "parça."])],
+}
+THREE = [(0, 60), (60, 120), (120, 180)]
+
+
+def test_silent_part_gets_no_hook_even_if_the_model_writes_one(monkeypatch):
+    prompts = []
+
+    def fake(client, model, prompt, schema):
+        prompts.append(prompt)
+        return {"parts": [{"part": n, "viral_hook_text": f"Hook {n} 🔥", "title": f"T{n}",
+                           "description": f"d{n}"} for n in (1, 2, 3)]}, None
+    monkeypatch.setattr(main, "_run_gemini_stage", fake)
+    hooks, _ = main.get_part_hooks(SILENT_MIDDLE, THREE)
+    assert [n["part"] for n in _prompt_parts(prompts[0])] == [1, 3]
+    assert hooks[1] == EMPTY_HOOK
+    assert hooks[0]["viral_hook_text"] == "Hook 1 🔥" and hooks[2]["title"] == "T3"
+    clips = parts.build_part_clips(THREE, hooks)
+    assert clips[1]["viral_hook_text"] == "2. Part"
+    assert clips[1]["video_title_for_youtube_short"] == "2. Part"
+    assert clips[1]["video_description_for_tiktok"] == ""
+
+
+def test_partial_response_leaves_the_missing_spoken_part_empty(monkeypatch, capsys):
+    def fake(client, model, prompt, schema):
+        return {"parts": [{"part": 1, "viral_hook_text": "Bak 😳", "title": "T1"}]}, None
+    monkeypatch.setattr(main, "_run_gemini_stage", fake)
+    hooks, _ = main.get_part_hooks(SILENT_MIDDLE, THREE)
+    assert hooks[0]["viral_hook_text"] == "Bak 😳"
+    assert hooks[1] == EMPTY_HOOK and hooks[2] == EMPTY_HOOK
+    # Only the spoken part the model skipped counts as missing.
+    assert "no hook for 1/3 part(s)" in capsys.readouterr().out

@@ -213,6 +213,14 @@ def use_prepared(output_dir, video_path, duration):
         return False
 
 
+def prepared_probabilities():
+    """``(probs, fps)`` use_prepared loaded and validated for this source, or
+    None when it loaded none (main.parts_scene_cuts)."""
+    if _prepared["probs"] is None or not _prepared["fps"]:
+        return None
+    return _prepared["probs"], _prepared["fps"]
+
+
 def register_clip(clip_path, start):
     """``clip_path`` was cut out of the source from ``start`` seconds."""
     with _clip_lock:

@@ -2731,8 +2731,11 @@ def get_part_hooks(transcript, ranges):
                 output_tokens=cost.get("output_tokens", 0),
                 total_cost=cost.get("total_cost", 0),
                 model=cost.get("model") or model_name)
-        hooks = parts.normalize_hooks(raw, n)
-        missing = sum(1 for h in hooks if not h["viral_hook_text"])
+        # A silent part was not in the prompt (spec §2, §4): whatever the
+        # model wrote for its number is not grounded in it, so it stays empty.
+        hooks = [h if text else dict.fromkeys(h, "")
+                 for h, text in zip(parts.normalize_hooks(raw, n), texts)]
+        missing = sum(1 for h, text in zip(hooks, texts) if text and not h["viral_hook_text"])
         if missing:
             print(f"⚠️ Parts: model returned no hook for {missing}/{n} part(s); those keep only \"N. Part\".")
         return hooks, cost_analysis
@@ -2761,31 +2764,79 @@ def parts_force_strategy(width, height):
     return "WIDE"
 
 
-def parts_scene_cuts(output_dir):
-    """Shot-boundary times (s) from the job's ``.scene_probs.json``
-    (prepare_scenes); ``[]`` when it is missing or unusable."""
-    import scene_detection
+def parts_framing(clips, strategy):
+    """Record the pinned WIDE layout as the clip editor's ``recipe.framing``
+    "full" (app.py ``_FRAMING_STRATEGIES``: "full" -> "WIDE"), so a re-render
+    from the source or a reframe keeps the full frame instead of running the
+    classifier again. A vertical source (``strategy`` None) gets no recipe."""
+    if strategy == "WIDE":
+        for clip in clips:
+            clip["recipe"] = {"framing": "full"}
+    return clips
+
+
+def parts_source_duration(input_video, fallback):
+    """The container duration (ffprobe) the parts are planned over, so the
+    last part ends at the real end of the file; OpenCV's frame count / fps
+    can be off on MKV. ``fallback`` (that estimate) on any probe problem."""
     try:
-        with open(os.path.join(output_dir, scene_detection.SCENES_CHECKPOINT)) as f:
-            payload = json.load(f)
-        probs = scene_detection.decode_probabilities(payload["probs"], int(payload["frames"]))
-        return parts.cut_times_from_probs(probs, float(payload["fps"]))
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", input_video],
+            capture_output=True, timeout=60)
+        value = float(proc.stdout.decode().strip()) if proc.returncode == 0 else 0.0
+        if math.isfinite(value) and value > 0:
+            return value
+    except Exception:
+        pass
+    return fallback
+
+
+def parts_prepare_scenes(input_video, output_dir, duration):
+    """Parts mode cuts on the scene changes too (build_parts), so the
+    whole-source probabilities are needed here. A checkpoint that already
+    belongs to this source (a resumed job) is reused; otherwise TransNetV2
+    runs once (prepare_scenes) and its result is loaded. True when
+    scene_detection holds validated probabilities for this source."""
+    import scene_detection
+    if scene_detection.use_prepared(output_dir, input_video, duration):
+        return True
+    prepare_scenes(input_video, output_dir)
+    return scene_detection.use_prepared(output_dir, input_video, duration)
+
+
+def parts_scene_cuts():
+    """Shot-boundary times (s) from the probabilities scene_detection.
+    use_prepared validated for THIS source (name and duration); ``[]`` when
+    none were loaded or they are unusable."""
+    import scene_detection
+    prepared = scene_detection.prepared_probabilities()
+    if prepared is None:
+        return []
+    try:
+        probs, fps = prepared
+        return parts.cut_times_from_probs(probs, fps)
     except Exception:
         return []
 
 
 def parts_burned_subtitles(input_video, environ=os.environ):
     """Parts mode keeps a source's own burned-in subtitles (spec §5): when the
-    vision check finds them, no captions are added for this job. Not found or
-    an error: our captions as usual. Skipped when captions are off anyway."""
+    vision check finds them, no captions are added for this job. Not found, or
+    the check cannot run (SUBTITLE_BAND_CHECK=0, no GEMINI_API_KEY, an error):
+    our captions as usual. Skipped when captions are off anyway."""
     if environ.get("AUTO_CAPTIONS", "1").strip() == "0":
         return
-    band = None
     try:
         import burned_subtitles
+        if not burned_subtitles.ENABLED or not os.getenv("GEMINI_API_KEY"):
+            print("📝 Parts: subtitle check unavailable — adding captions.")
+            return
         band = burned_subtitles.detect(input_video)
     except Exception as e:
         print(f"⚠️ Burned-in subtitle check skipped ({e}).")
+        print("📝 Parts: subtitle check unavailable — adding captions.")
+        return
     if band is not None:
         environ["AUTO_CAPTIONS"] = "0"
         print("📝 Parts: source has burned-in subtitles — keeping them, no captions added.")
@@ -2793,14 +2844,14 @@ def parts_burned_subtitles(input_video, environ=os.environ):
         print("📝 Parts: no burned-in subtitles — adding captions.")
 
 
-def build_parts(transcript, duration, output_dir, part_seconds):
+def build_parts(transcript, duration, part_seconds):
     """``--parts``: the whole video as sequential parts (spec §3) in the
     ``get_viral_clips`` shape, ``{"shorts": [...], "cost_analysis": {...}}``."""
     import clip_selection
     ranges = parts.plan_parts(duration, part_seconds,
                               parts.words_from_transcript(transcript),
                               parts.sentence_end_times(transcript),
-                              parts_scene_cuts(output_dir),
+                              parts_scene_cuts(),
                               max_parts=clip_selection.max_clips_per_job())
     if ranges and ranges[-1][1] < float(duration):
         print(f"⚠️ Parts: capped at {len(ranges)} parts — the video after "
@@ -3317,9 +3368,11 @@ if __name__ == '__main__':
         # worker's job): the clips map them instead of running TransNetV2.
         import scene_detection
         if args.parts:
-            # The parts are cut on the scene changes too (build_parts).
-            prepare_scenes(input_video, output_dir)
-        scene_detection.use_prepared(output_dir, input_video, duration)
+            # The parts are cut on the scene changes too (build_parts); a
+            # resumed job reuses the checkpoint it already prepared.
+            parts_prepare_scenes(input_video, output_dir, duration)
+        else:
+            scene_detection.use_prepared(output_dir, input_video, duration)
 
         # 3. Transcribe — unless the video has no audio, in which case fall back
         # to Gemini vision (picks clips from the imagery instead of the speech).
@@ -3387,7 +3440,10 @@ if __name__ == '__main__':
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
         if args.parts:
-            clips_data = build_parts(transcript, duration, output_dir, args.parts)
+            # Planned over the container duration so the last part ends at
+            # the real end of the file (OpenCV's estimate can be off on MKV).
+            clips_data = build_parts(transcript, parts_source_duration(input_video, duration),
+                                     args.parts)
         elif (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
             print("♻️ Using the clips Gemini picked while the video downloaded.")
@@ -3417,6 +3473,15 @@ if __name__ == '__main__':
             clips_data['output_format'] = output_format
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band
+            # Parts are pinned to one layout (spec §5); the metadata records
+            # it so the clip editor's re-renders keep it.
+            parts_strategy = None
+            if args.parts:
+                _cap = cv2.VideoCapture(input_video)
+                parts_strategy = parts_force_strategy(int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                                                      int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                _cap.release()
+                parts_framing(clips_data['shorts'], parts_strategy)
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             write_json_atomic(metadata_file, clips_data, indent=2)
             print(f"   Saved metadata to {metadata_file}")
@@ -3424,12 +3489,6 @@ if __name__ == '__main__':
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
-            parts_strategy = None
-            if args.parts:
-                _cap = cv2.VideoCapture(input_video)
-                parts_strategy = parts_force_strategy(int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                                                      int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-                _cap.release()
 
             def _process_one_clip(i, clip):
                 if clip.get('pro_before'):
