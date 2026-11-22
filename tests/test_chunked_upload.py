@@ -196,3 +196,85 @@ def test_unreadable_final_chunk_400(dirs, monkeypatch):
     slot = app_module.pending_uploads[uid]
     assert slot["complete"] is False and slot["bytes"] == 0
     assert not os.path.exists(slot["path"])
+
+
+# --- Overlapping and aborted chunk requests (fake request, endpoint called directly) ---
+
+class _FakeRequest:
+    def __init__(self, parts, **params):
+        self.query_params = {k: str(v) for k, v in params.items()}
+        self._parts = parts
+
+    async def stream(self):
+        for part in self._parts:
+            if isinstance(part, asyncio.Event):
+                await part.wait()
+            elif isinstance(part, BaseException):
+                raise part
+            else:
+                yield part
+
+
+def test_overlapping_chunk_gets_409_upload_in_progress(dirs):
+    uid = _slot()
+    path = _path(uid)
+
+    async def _run():
+        gate = asyncio.Event()
+        first = asyncio.create_task(app_module.put_upload(
+            uid, _FakeRequest([b"a" * 5, gate, b"a" * 5], offset=0, size=10)))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert app_module.pending_uploads[uid].get("busy") is True
+        for req in (_FakeRequest([b"b" * 10], offset=0), _FakeRequest([b"b" * 10], offset=5),
+                    _FakeRequest([b"b" * 10])):  # chunked retry, and a whole-body PUT
+            with pytest.raises(app_module.HTTPException) as exc:
+                await app_module.put_upload(uid, req)
+            assert exc.value.status_code == 409 and exc.value.detail == "upload in progress"
+        gate.set()
+        return await first
+
+    result = asyncio.run(_run())
+    assert result["received"] == 10 and result["complete"] is True
+    with open(path, "rb") as f:
+        assert f.read() == b"a" * 10
+    slot = app_module.pending_uploads[uid]
+    assert slot["bytes"] == 10 and "busy" not in slot
+
+
+def test_disconnect_midway_drops_the_chunk_and_retry_succeeds(dirs):
+    from starlette.requests import ClientDisconnect
+    uid = _slot()
+    path = _path(uid)
+    assert _put(uid, b"a" * 10, offset=0).status_code == 200
+
+    async def _cut():
+        await app_module.put_upload(uid, _FakeRequest([b"x" * 7, ClientDisconnect()], offset=10))
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(_cut())
+    slot = app_module.pending_uploads[uid]
+    assert os.path.getsize(path) == 10 and slot["bytes"] == 10 and "busy" not in slot
+
+    r = _put(uid, b"b" * 10, offset=10, size=20)
+    assert r.status_code == 200 and r.json()["complete"] is True
+    with open(path, "rb") as f:
+        assert f.read() == b"a" * 10 + b"b" * 10
+
+
+def test_expected_offset_is_the_real_file_size(dirs):
+    uid = _slot()
+    assert _put(uid, b"a" * 10, offset=0).status_code == 200
+    with open(_path(uid), "ab") as f:  # the file grew behind the slot's back
+        f.write(b"?" * 3)
+    r = _put(uid, b"b" * 10, offset=10)
+    assert r.status_code == 409 and r.json() == {"detail": "expected offset 13"}
+    assert app_module.pending_uploads[uid]["bytes"] == 13
+
+
+def test_cap_counts_the_whole_file(dirs, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_FILE_SIZE_MB", 1)
+    limit = 1024 * 1024
+    uid = _slot()
+    assert _put(uid, b"a" * limit, offset=0).status_code == 200
+    r = _put(uid, b"b", offset=limit)
+    assert r.status_code == 413 and not os.path.exists(_path(uid))

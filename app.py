@@ -5972,8 +5972,22 @@ async def put_upload(upload_id: str, request: Request):
     if not slot or time.time() - slot["created"] > UPLOAD_TTL_SECONDS:
         pending_uploads.pop(upload_id, None)
         raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
-    if "offset" in request.query_params:
-        return await _put_upload_chunk(upload_id, slot, request)
+    # One write per slot at a time: a retry that overlaps a request still
+    # streaming (or a whole-body PUT racing a chunk) would interleave bytes,
+    # and the aborted one's cleanup would cut what the other wrote.
+    if slot.get("busy"):
+        raise HTTPException(status_code=409, detail="upload in progress")
+    slot["busy"] = True
+    try:
+        if "offset" in request.query_params:
+            return await _put_upload_chunk(upload_id, slot, request)
+        return await _put_upload_whole(upload_id, slot, request)
+    finally:
+        slot.pop("busy", None)
+
+
+async def _put_upload_whole(upload_id, slot, request):
+    """The whole video in one body: replaces whatever the slot held."""
     limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     size = 0
     with open(slot["path"], "wb") as out:
@@ -6016,28 +6030,33 @@ async def _put_upload_chunk(upload_id, slot, request):
     remote worker's chunk upload): it must start where the last chunk ended,
     and offset 0 starts over. ``slot["bytes"]`` is what is on disk. The chunk
     carrying ``size`` must make the file exactly that long; it completes the
-    slot and runs the duration probe. A completed slot only takes offset 0."""
+    slot and runs the duration probe. A completed slot only takes offset 0.
+    The caller (put_upload) holds the slot's busy flag, so this is the file's
+    only writer and its real size is the offset to continue from."""
     offset = _upload_query_int(request.query_params, "offset")
     size = _upload_query_int(request.query_params, "size")
     path = slot["path"]
-    have = slot["bytes"] if os.path.exists(path) else 0
+    try:
+        have = os.path.getsize(path)
+    except OSError:
+        have = 0
+    slot["bytes"] = have
     if offset != 0 and (offset != have or slot.get("complete")):
-        slot["bytes"] = have
         raise HTTPException(status_code=409, detail=f"expected offset {have}")
     limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     if offset == 0:
         slot.update({"bytes": 0, "complete": False})
-    received = offset
     with open(path, "wb" if offset == 0 else "ab") as out:
         try:
             async for chunk in request.stream():
-                received += len(chunk)
-                if received > limit_bytes:
+                # The cap is on the file, not on this request's share of it.
+                if out.tell() + len(chunk) > limit_bytes:
                     out.close()
                     _remove_if_present(path)
                     slot.update({"bytes": 0, "complete": False})
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                 out.write(chunk)
+            received = out.tell()
         except HTTPException:
             raise
         except BaseException:
