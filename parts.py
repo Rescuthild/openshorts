@@ -7,6 +7,8 @@ largest ≥ 0.3 s pause within ±5 s, the nearest scene cut (or the target itsel
 when nobody speaks within ±5 s, and finally the nearest word end. A cut never
 falls inside a word, and no part is longer than 180 s.
 """
+import json
+import re
 from typing import Sequence
 
 WINDOW = 5.0            # first search window around the target, seconds
@@ -176,3 +178,106 @@ def plan_parts(duration: float, part_seconds: int,
             and ranges[-1][1] - ranges[-2][0] <= MAX_PART):
         ranges[-2:] = [(ranges[-2][0], ranges[-1][1])]
     return ranges
+
+
+# --- Hooks and clip dicts (spec §3.5, §4) ------------------------------------
+
+PART_TEXT_CHARS = 1500  # transcript characters per part sent to the model
+
+_HOOK_FIELDS = ("viral_hook_text", "title", "description")
+_PART_PREFIX = re.compile(r"^\s*\d+\.\s*Part\b[:\-–]?\s*", re.IGNORECASE)
+
+HOOKS_PROMPT_TEMPLATE = """You write hooks for a video that has been cut into {n} sequential parts \
+published as a series ("1. Part", "2. Part", ...).
+The video's language is "{language}". Write every hook, title and description in that \
+language; do not translate the transcript.
+
+For EVERY part below, return:
+- viral_hook_text: at most 10 words with 1-2 emojis, grounded in what is said in THAT part. \
+It should feel like an episode of a series, but each hook comes from its own part's content.
+- title: a short title for that part.
+- description: one sentence describing that part.
+
+Never write "Part" or the part number in viral_hook_text or title; the code adds the \
+"N. Part" label itself. Return one entry per part, using the part numbers given.
+
+PARTS_JSON:
+{parts_json}
+"""
+
+
+def part_texts(transcript: dict | None, ranges: list[tuple[float, float]],
+               max_chars: int = PART_TEXT_CHARS) -> list[str]:
+    """The spoken text of each ``(start, end)`` range (a word belongs to the
+    range its start falls in), cut at a word boundary to ``max_chars``."""
+    words = words_from_transcript(transcript)
+    out = []
+    for i, (start, end) in enumerate(ranges):
+        last = i == len(ranges) - 1
+        text = " ".join(w.strip() for s, _, w in words
+                        if w.strip() and start <= s and (s < end or last and s <= end))
+        if len(text) > max_chars:
+            cut = text[:max_chars]
+            text = cut.rsplit(" ", 1)[0] if " " in cut else cut
+        out.append(text)
+    return out
+
+
+def build_hooks_prompt(language: str, texts: list[str]) -> str:
+    """The single hooks request for every part's text (``texts[i]`` is part
+    ``i + 1``)."""
+    payload = [{"part": i + 1, "text": t or "(no speech)"} for i, t in enumerate(texts)]
+    return HOOKS_PROMPT_TEMPLATE.format(
+        n=len(texts), language=language or "unknown",
+        parts_json=json.dumps(payload, ensure_ascii=False, indent=1))
+
+
+def _clean(value) -> str:
+    return str(value or "").strip()
+
+
+def normalize_hooks(raw: dict | None, n_parts: int) -> list[dict]:
+    """Exactly ``n_parts`` ``{"viral_hook_text", "title", "description"}``
+    dicts, matched by the model's part number; missing parts stay empty,
+    numbers outside ``1..n_parts`` are dropped and a leading "N. Part" the
+    model wrote anyway is removed."""
+    hooks = [dict.fromkeys(_HOOK_FIELDS, "") for _ in range(n_parts)]
+    items = raw.get("parts") if isinstance(raw, dict) else None
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            n = int(item.get("part"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= n <= n_parts or n in seen:
+            continue
+        seen.add(n)
+        hooks[n - 1] = {
+            "viral_hook_text": _PART_PREFIX.sub("", _clean(item.get("viral_hook_text"))).strip(),
+            "title": _PART_PREFIX.sub("", _clean(item.get("title"))).strip(),
+            "description": _clean(item.get("description")),
+        }
+    return hooks
+
+
+def build_part_clips(ranges: list[tuple[float, float]], hooks: list[dict]) -> list[dict]:
+    """One clip dict per range in the existing clip schema, labelled
+    "N. Part"; no ``predicted_score`` so the gallery keeps part order."""
+    clips = []
+    for i, (start, end) in enumerate(ranges):
+        n = i + 1
+        h = hooks[i] if i < len(hooks) else {}
+        hook, title = _clean(h.get("viral_hook_text")), _clean(h.get("title"))
+        description = _clean(h.get("description"))
+        clips.append({
+            "start": float(start),
+            "end": float(end),
+            "part_number": n,
+            "viral_hook_text": f"{n}. Part\n{hook}" if hook else f"{n}. Part",
+            "video_title_for_youtube_short": f"{n}. Part – {title}" if title else f"{n}. Part",
+            "video_description_for_tiktok": description,
+            "video_description_for_instagram": description,
+        })
+    return clips

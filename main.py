@@ -30,6 +30,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import parts
 import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
@@ -2691,6 +2692,53 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
         return None
+
+
+def get_part_hooks(transcript, ranges):
+    """Parts mode: hook, title and description for every part in ONE model
+    request (spec 2026-11-23-parts-mode §4). Returns
+    ``(parts.normalize_hooks(...), cost_analysis)``.
+
+    Never raises: a failed or policy-blocked request, or a missing key, leaves
+    the hooks empty (the parts still ship as "N. Part") with a warning. When
+    no part has any spoken words the model is not called at all."""
+    n = len(ranges)
+    model_name = (llm_backend.model_name() if llm_backend.active()
+                  else os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite')
+    cost_analysis = {"input_tokens": 0, "output_tokens": 0, "total_cost": 0.0,
+                     "model": model_name}
+    empty = parts.normalize_hooks(None, n)
+    try:
+        texts = parts.part_texts(transcript, ranges)
+        if not any(texts):
+            print("ℹ️ Parts: no spoken words; parts get no hooks (model not called).")
+            return empty, cost_analysis
+        language = str((transcript or {}).get("language") or "unknown")
+        if llm_backend.active():
+            client = None
+        else:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                print("⚠️ Parts: GEMINI_API_KEY not set; parts get no hooks.")
+                return empty, cost_analysis
+            client = genai.Client(api_key=api_key, http_options=gemini_http_options())
+        print(f"\U0001f916  Parts: writing hooks for {n} part(s) | model: {model_name} | language: {language}")
+        raw, cost = _run_gemini_stage(client, model_name, parts.build_hooks_prompt(language, texts),
+                                      gemini_worker.PartHooksResponse)
+        if cost:
+            cost_analysis.update(
+                input_tokens=cost.get("input_tokens", 0),
+                output_tokens=cost.get("output_tokens", 0),
+                total_cost=cost.get("total_cost", 0),
+                model=cost.get("model") or model_name)
+        hooks = parts.normalize_hooks(raw, n)
+        missing = sum(1 for h in hooks if not h["viral_hook_text"])
+        if missing:
+            print(f"⚠️ Parts: model returned no hook for {missing}/{n} part(s); those keep only \"N. Part\".")
+        return hooks, cost_analysis
+    except Exception as e:  # GeminiBlockedError included: hooks are optional
+        print(f"⚠️ Parts: hook request failed, parts get no hooks: {e}")
+        return empty, cost_analysis
 
 
 # --- Speech too sparse to clip by transcript -------------------------------
