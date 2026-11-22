@@ -36,6 +36,7 @@ import { track } from './lib/analytics';
 import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
 import { rememberTabAfterLogin } from './lib/tabAfterLogin';
 import { JobPollError, pollFailureAction } from './lib/jobPoll';
+import { uploadInChunks } from './lib/chunkedUpload';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -1241,6 +1242,11 @@ function App() {
     }
   };
 
+  // A file already uploaded whose /api/process was refused with a 402: the
+  // server hands the slot back, so the quota wall's "clip the first N minutes"
+  // resend reuses it instead of uploading the same file again.
+  const refusedUploadRef = useRef(null); // { file, uploadId }
+
   const handleProcess = async (data, forceLowQuality = false) => {
     // Hosted: must be signed in AND on an active plan/trial. Self-host: BYOK keys.
     if (billingEnabled) {
@@ -1271,6 +1277,7 @@ function App() {
     setPartialJob(null);
     setFirstVideoJob(false);
 
+    let uploadId = null;
     try {
       let body;
       // BYOK sends the Gemini header; managed users rely on the bearer token
@@ -1317,14 +1324,27 @@ function App() {
           ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
         });
       } else {
-        const formData = new FormData();
-        formData.append('file', data.payload);
-        formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
-        formData.append('output_format', data.outputFormat || 'auto');
-        for (const [k, v] of Object.entries(advanced)) {
-          if (v != null) formData.append(k, v);
+        // Files go up first in 50 MB chunks (Cloudflare refuses request bodies
+        // over 100 MB), then the job starts from the upload_id.
+        const refused = refusedUploadRef.current;
+        refusedUploadRef.current = null;
+        if (refused && refused.file === data.payload) {
+          uploadId = refused.uploadId;
+        } else {
+          setLogs(l => [...l, 'Yükleniyor %0']);
+          setLogTimes(t => [...t, Date.now() / 1000]);
+          uploadId = await uploadInChunks(data.payload, {
+            fetchFn: apiFetch,
+            onProgress: (p) => setLogs(l => [...l.slice(0, -1), `Yükleniyor %${Math.floor(p * 100)}`]),
+          });
         }
-        body = formData;
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify({
+          upload_id: uploadId,
+          acknowledged: !!data.acknowledged,
+          output_format: data.outputFormat || 'auto',
+          ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
+        });
       }
 
       const res = await apiFetch('/api/process', { method: 'POST', headers, body });
@@ -1356,6 +1376,10 @@ function App() {
       refreshMe();
 
     } catch (e) {
+      // A 402 from /api/process puts the uploaded file back in its slot.
+      if (e instanceof QuotaError && uploadId) {
+        refusedUploadRef.current = { file: data.payload, uploadId };
+      }
       if (e instanceof QuotaError && e.code === 'free_queue_full') {
         // The free queue is full: nothing was reserved or spent. Same plan
         // wall, its own copy and source so the funnel is measured apart.
